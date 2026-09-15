@@ -85,7 +85,9 @@ class BoostManager {
       if (proxy?.key) this.pool?.markUsed?.(proxy)
     } else {
       this.stats.fail++
-      if (proxy?.key && (result.error === "proxy_error" || result.error === "timeout")) {
+      const err = String(result.error || "")
+      // proxy is dead/MITM/unreachable → mark it so it's never retried
+      if (proxy?.key && (err.startsWith("proxy_error") || err.includes("proxy") || err.includes("timeout") || err.includes("tunnel"))) {
         this.pool?.markDead?.(proxy)
       } else if (proxy?.key) {
         this.pool?.markUsed?.(proxy)

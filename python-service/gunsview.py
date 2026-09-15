@@ -133,6 +133,73 @@ window.__allRequests = [];
 """
 
 
+async def _setup_proxy_auth(browser, proxy_url):
+    """Handle proxy authentication (user:pass@host:port) via CDP Fetch domain.
+    Chrome doesn't accept proxy credentials in the --proxy-server flag for
+    SOCKS5, so we answer the auth challenge via CDP."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        if not parsed.username or not parsed.password:
+            return None
+        username = parsed.username
+        password = parsed.password
+
+        async def auth_handler(event):
+            if event.authChallenge.source == "Proxy":
+                await event.respond(
+                    username=username,
+                    password=password,
+                )
+            else:
+                await event.continue_request()
+
+        browser.add_handler(cdp.fetch.AuthRequired, auth_handler)
+        # enable the Fetch domain to intercept auth challenges
+        await browser.send(cdp.fetch.enable(handle_auth_requests=True))
+        return auth_handler
+    except Exception:
+        return None
+
+
+# error-page detection — Chrome/Edge shows these titles when a proxy or TLS fails
+_ERROR_PAGE_SIGNALS = [
+    "your connection is not private",
+    "your connection isn't secure",
+    "connexion n'est pas sécurisée",
+    "connexion n'est pas privée",
+    "ce site ne peut pas fournir de connexion sécurisée",
+    "err_cert_authority_invalid",
+    "err_cert_common_name_invalid",
+    "err_proxy_connection_failed",
+    "err_tunnel_connection_failed",
+    "err_name_not_resolved",
+    "err_connection_refused",
+    "err_connection_reset",
+    "err_connection_timed_out",
+    "err_proxy_certIFICATE_invalid",
+    "err_ssl_protocol_error",
+    "err_empty_response",
+]
+
+
+async def _detect_error_page(page) -> str | None:
+    """Return a short error code if the page is showing a Chrome/Edge
+    connection-error page (proxy dead, TLS MITM, etc.), else None."""
+    try:
+        text = await page.evaluate(
+            "(document.body?.innerText || document.title || '').slice(0, 500).toLowerCase()"
+        )
+        if not text:
+            return None
+        for sig in _ERROR_PAGE_SIGNALS:
+            if sig in text:
+                return sig
+    except Exception:
+        pass
+    return None
+
+
 async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy: str = None) -> dict:
     # resolve {session} placeholder → new IP each time
     resolved_proxy = _resolve_proxy_session(proxy) if proxy else None
@@ -140,6 +207,12 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
     browser_args = []
     if resolved_proxy:
         browser_args.append(f"--proxy-server={resolved_proxy}")
+        # proxies (especially free/MITM ones) often present untrusted TLS certs
+        # when tunneling HTTPS — ignore cert errors so the page actually loads
+        browser_args.append("--ignore-certificate-errors")
+        browser_args.append("--ignore-ssl-errors")
+        # allow auth challenges from proxies to be answered via CDP
+        browser_args.append("--disable-web-security")
 
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
@@ -148,6 +221,11 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
         lang="en-US",
         browser_args=browser_args,
     )
+
+    # handle proxy authentication (user:pass@host:port) via CDP Fetch domain
+    proxy_auth_handler = None
+    if resolved_proxy and "@" in resolved_proxy:
+        proxy_auth_handler = _setup_proxy_auth(browser, resolved_proxy)
 
     try:
         siteurl = f"https://guns.lol/{username}"
@@ -166,6 +244,17 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
 
         # wait for the page to load
         await asyncio.sleep(random.uniform(2.0, 4.0))
+
+        # early bail: if the proxy is dead/MITM, the browser shows an error page
+        # instead of guns.lol — detect it and fail fast (don't waste 90s)
+        err = await _detect_error_page(page)
+        if err:
+            return {
+                "ok": False,
+                "error": f"proxy_error:{err}",
+                "username": username,
+                "worker_id": worker_id,
+            }
 
         # inject the view-hook JS
         try:
@@ -230,6 +319,16 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
         interstitial_gone = False
 
         while time.time() < deadline:
+            # bail early if the page flipped to a connection-error page
+            err = await _detect_error_page(page)
+            if err:
+                return {
+                    "ok": False,
+                    "error": f"proxy_error:{err}",
+                    "username": username,
+                    "worker_id": worker_id,
+                }
+
             # check if the view POST was captured in __allRequests
             try:
                 raw_reqs = await page.evaluate("window.__allRequests || []")
