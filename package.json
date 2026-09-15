@@ -1,0 +1,78 @@
+{
+  "name": "guns-view",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node server/index.js",
+    "dev:all": "concurrently -n web,api -c magenta,cyan \"npm:dev\" \"npm:dev:server\"",
+    "electron:dev": "concurrently -n web,app -c magenta,cyan \"npm:dev\" \"wait-on http://localhost:5173 && cross-env ELECTRON_RUN_AS_NODE= electron .\"",
+    "build": "vite build",
+    "build:app": "vite build && electron-builder",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "start": "cross-env ELECTRON_RUN_AS_NODE= electron ."
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "concurrently": "^10.0.5",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "tailwindcss": "^4.3.3",
+    "wait-on": "^9.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "cross-env": "^10.1.0",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0"
+  },
+  "build": {
+    "appId": "com.gunsview.app",
+    "productName": "gunsview",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "server/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "server/**"
+    ],
+    "extraResources": [
+      {
+        "from": "python-service",
+        "to": "python-service",
+        "filter": [
+          "**/*.py",
+          "requirements.txt"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "public/favicon.svg"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "allowScripts": {
+    "electron@44.3.0": true
+  }
+}
