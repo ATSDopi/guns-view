@@ -133,6 +133,26 @@ window.__allRequests = [];
 """
 
 
+# locate the "click to enter" element's center coordinates.
+# Returns "x,y" string (nodriver reliably serializes strings, objects not so much)
+_FIND_INTERSTITIAL_JS = r"""
+(function() {
+    var els = document.querySelectorAll('a, button, div, span, [role="button"], input');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        var text = (el.innerText || el.value || '').toLowerCase();
+        if (text.includes('click to enter')) {
+            var rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                return (rect.x + rect.width/2) + ',' + (rect.y + rect.height/2);
+            }
+        }
+    }
+    return '';
+})()
+"""
+
+
 async def _setup_proxy_auth(browser, proxy_url):
     """Handle proxy authentication (user:pass@host:port) via CDP Fetch domain.
     Chrome doesn't accept proxy credentials in the --proxy-server flag for
@@ -204,7 +224,17 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
     # resolve {session} placeholder → new IP each time
     resolved_proxy = _resolve_proxy_session(proxy) if proxy else None
 
-    browser_args = []
+    browser_args = [
+        # anti-throttling: without these, Chrome heavily slows down JS timers in
+        # background/occluded windows — Turnstile then takes forever and real
+        # clicks only work after the user focuses the window (Alt-Tab)
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion",
+        # open maximized so the window is visible on screen
+        "--start-maximized",
+    ]
     if resolved_proxy:
         browser_args.append(f"--proxy-server={resolved_proxy}")
         # proxies (especially free/MITM ones) often present untrusted TLS certs
@@ -231,95 +261,20 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
         siteurl = f"https://guns.lol/{username}"
         page = await browser.get(siteurl)
 
-        # inject the view-hook JS as early as possible
-        try:
-            await page.evaluate(_VIEW_HOOK_JS)
-        except Exception:
-            # page might not be ready yet — retry after a short wait
-            await asyncio.sleep(1.0)
+        # inject the view-hook JS as soon as the page accepts evaluate()
+        for _ in range(10):
             try:
                 await page.evaluate(_VIEW_HOOK_JS)
+                break
             except Exception:
-                pass
+                await asyncio.sleep(0.5)
 
-        # wait for the page to load
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-        # early bail: if the proxy is dead/MITM, the browser shows an error page
-        # instead of guns.lol — detect it and fail fast (don't waste 90s)
-        err = await _detect_error_page(page)
-        if err:
-            return {
-                "ok": False,
-                "error": f"proxy_error:{err}",
-                "username": username,
-                "worker_id": worker_id,
-            }
-
-        # inject the view-hook JS
-        try:
-            await page.evaluate(_VIEW_HOOK_JS)
-        except Exception:
-            pass
-
-        # simulate human mouse movements (helps with bot detection)
-        for _ in range(random.randint(3, 6)):
-            x = random.uniform(200, 600)
-            y = random.uniform(150, 450)
-            await page.mouse_move(x, y)
-            await asyncio.sleep(random.uniform(0.05, 0.2))
-
-        # bring the browser window to the foreground (needed for real mouse clicks)
-        try:
-            await page.send(cdp.page.bring_to_front())
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-
-        # find the center of the interstitial element, then do a REAL mouse click
-        # real mouse clicks produce isTrusted=true events, which Turnstile requires
+        # ---- wait for the interstitial to render, then click immediately ----
+        # Cloudflare's PoW runs first; the "click to enter" element only appears
+        # once it completes. Poll for it instead of sleeping a fixed duration.
         click_coords = None
-        try:
-            coords = await page.evaluate(r"""
-            (function() {
-                var els = document.querySelectorAll('a, button, div, span, [role="button"]');
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    var text = (el.innerText || '').toLowerCase();
-                    if (text.includes('click to enter')) {
-                        var rect = el.getBoundingClientRect();
-                        return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
-                    }
-                }
-                // fallback: click center of viewport
-                return {x: window.innerWidth/2, y: window.innerHeight/2};
-            })()
-            """)
-            if coords and isinstance(coords, dict):
-                click_coords = coords
-        except Exception:
-            pass
-
-        if not click_coords:
-            click_coords = {"x": 400, "y": 300}
-
-        cx = float(click_coords.get("x", 400))
-        cy = float(click_coords.get("y", 300))
-
-        # move mouse to the target with human-like movement, then real click
-        await page.mouse_move(cx - 50, cy - 30)
-        await asyncio.sleep(random.uniform(0.1, 0.2))
-        await page.mouse_move(cx, cy)
-        await asyncio.sleep(random.uniform(0.08, 0.15))
-        await page.mouse_click(cx, cy)
-
-        # wait for the view POST to fire and complete
-        deadline = time.time() + timeout
-        view_result = None
-        interstitial_gone = False
-
-        while time.time() < deadline:
-            # bail early if the page flipped to a connection-error page
+        find_deadline = time.time() + 40
+        while time.time() < find_deadline and click_coords is None:
             err = await _detect_error_page(page)
             if err:
                 return {
@@ -328,37 +283,66 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
                     "username": username,
                     "worker_id": worker_id,
                 }
-
-            # check if the view POST was captured in __allRequests
             try:
-                raw_reqs = await page.evaluate("window.__allRequests || []")
-                if raw_reqs:
-                    reqs = _normalize_nodriver_list(raw_reqs)
-                    for req in reqs:
-                        url = req.get("url", "")
-                        if "analytics/view" in url or ("analytics" in url and req.get("status", 0) >= 200):
-                            view_result = req
-                            await asyncio.sleep(1.0)
-                            break
+                coords = await page.evaluate(_FIND_INTERSTITIAL_JS)
+                if isinstance(coords, str) and "," in coords:
+                    x, y = coords.split(",")
+                    click_coords = {"x": float(x), "y": float(y)}
+                    break
             except Exception:
                 pass
-            if view_result:
+            await asyncio.sleep(0.5)
+
+        if click_coords is None:
+            # interstitial never appeared — maybe the page entered directly
+            return {
+                "ok": False,
+                "error": "interstitial_not_found",
+                "username": username,
+                "worker_id": worker_id,
+            }
+
+        # ---- click attempts: real trusted mouse click, retry if no POST ----
+        view_result = None
+        interstitial_gone = False
+        max_attempts = 3
+        overall_deadline = time.time() + timeout
+
+        for attempt in range(max_attempts):
+            if time.time() > overall_deadline:
                 break
 
-            # also check if interstitial is gone (backup signal)
+            # bring the window to front so the renderer isn't throttled
             try:
-                text = await page.evaluate("document.body?.innerText?.slice(0, 200) || ''")
-                if text and "click to enter" not in text.lower():
-                    interstitial_gone = True
+                await page.send(cdp.page.bring_to_front())
             except Exception:
                 pass
 
-            await asyncio.sleep(1.0)
+            cx = float(click_coords.get("x", 400))
+            cy = float(click_coords.get("y", 300))
 
-        # if we didn't capture the POST but interstitial is gone, wait more
-        if not view_result and interstitial_gone:
-            # give the page time to send the POST after the click
-            for _ in range(10):
+            # human-like approach then real click
+            try:
+                await page.mouse_move(cx - 50, cy - 30)
+                await asyncio.sleep(random.uniform(0.08, 0.15))
+                await page.mouse_move(cx, cy)
+                await asyncio.sleep(random.uniform(0.05, 0.12))
+                await page.mouse_click(cx, cy)
+            except Exception:
+                pass
+
+            # wait for the view POST (up to ~12s per attempt)
+            wait_deadline = min(time.time() + 12, overall_deadline)
+            while time.time() < wait_deadline:
+                err = await _detect_error_page(page)
+                if err:
+                    return {
+                        "ok": False,
+                        "error": f"proxy_error:{err}",
+                        "username": username,
+                        "worker_id": worker_id,
+                    }
+
                 try:
                     raw_reqs = await page.evaluate("window.__allRequests || []")
                     if raw_reqs:
@@ -372,7 +356,28 @@ async def _send_view(username: str, timeout: int = 90, worker_id: int = 0, proxy
                     pass
                 if view_result:
                     break
-                await asyncio.sleep(1.0)
+
+                # check if interstitial is gone (click was accepted, POST may lag)
+                try:
+                    text = await page.evaluate("document.body?.innerText?.slice(0, 300) || ''")
+                    if text and "click to enter" not in text.lower():
+                        interstitial_gone = True
+                except Exception:
+                    pass
+
+                await asyncio.sleep(0.7)
+
+            if view_result:
+                break
+
+            # re-locate the interstitial before the next click attempt
+            try:
+                coords = await page.evaluate(_FIND_INTERSTITIAL_JS)
+                if isinstance(coords, str) and "," in coords:
+                    x, y = coords.split(",")
+                    click_coords = {"x": float(x), "y": float(y)}
+            except Exception:
+                pass
 
         if view_result:
             status = view_result.get("status", 0)
