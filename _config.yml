@@ -1,0 +1,4 @@
+title: guns-view
+description: Educational Electron desktop app exploring browser automation, anti-bot systems and proxy management — drives real browser views on guns.lol profiles
+plugins:
+  - jekyll-sitemap
